@@ -24,6 +24,9 @@ class RNNBase(Module):
         num_directions = 2 if bidirectional else 1
 
         self._all_weights = []
+        self._num_params = 0
+        # NOTE: these two always include biases (even when self.bias is False)
+        self._param_numels = []
         for layer in range(num_layers):
             for direction in range(num_directions):
                 layer_input_size = input_size if layer == 0 else hidden_size * num_directions
@@ -39,6 +42,10 @@ class RNNBase(Module):
                 b_ih = Parameter(torch.Tensor(gate_size))
                 b_hh = Parameter(torch.Tensor(gate_size))
 
+                layer_params = (w_ih, w_hh, b_ih, b_hh)
+                self._num_params += sum(p.numel() for p in layer_params)
+                self._param_numels += [p.numel() for p in layer_params]
+
                 suffix = '_reverse' if direction == 1 else ''
                 weights = ['weight_ih_l{}{}', 'weight_hh_l{}{}', 'bias_ih_l{}{}', 'bias_hh_l{}{}']
                 weights = [x.format(layer, suffix) for x in weights]
@@ -51,7 +58,20 @@ class RNNBase(Module):
                 else:
                     self._all_weights += [weights[:2]]
 
+        self.flatten_parameters()
         self.reset_parameters()
+
+    def flatten_parameters(self):
+        flat_param_tensor = self.weight_ih_l0.data.new(self._num_params).zero_()
+        offset = 0
+        parameters = self.parameters()
+        for i, numel in enumerate(self._param_numels):
+            if self.bias or i % 4 < 2: # when self.bias is False, we ignore 2 entries for biases at every layer
+                param = next(parameters)
+                param.data.set_(flat_param_tensor[offset:offset + numel].view_as(param.data))
+            offset += numel
+        assert offset == flat_param_tensor.numel()
+        self._data_ptrs = list(p.data.data_ptr() for p in self.parameters())
 
     def reset_parameters(self):
         stdv = 1.0 / math.sqrt(self.hidden_size)
@@ -76,6 +96,13 @@ class RNNBase(Module):
             if self.mode == 'LSTM':
                 hx = (hx, hx)
 
+        has_flat_weights = list(p.data.data_ptr() for p in self.parameters()) == self._data_ptrs
+        if has_flat_weights:
+            first_data = next(self.parameters()).data
+            assert first_data.storage().size() == self._num_params
+            flat_weight = first_data.new().set_(first_data.storage(), 0, torch.Size([self._num_params]))
+        else:
+            flat_weight = None
         func = self._backend.RNN(
             self.mode,
             self.input_size,
@@ -86,12 +113,48 @@ class RNNBase(Module):
             train=self.training,
             bidirectional=self.bidirectional,
             batch_sizes=batch_sizes,
-            dropout_state=self.dropout_state
+            dropout_state=self.dropout_state,
+            flat_weight=flat_weight
         )
         output, hidden = func(input, self.all_weights, hx)
         if is_packed:
             output = PackedSequence(output, batch_sizes)
         return output, hidden
+
+    def cuda(self, device_id=None):
+        """Moves all model parameters and buffers to the GPU.
+
+        Arguments:
+            device_id (int, optional): if specified, all parameters will be
+                copied to that device
+        """
+        ret = super(RNNBase, self).cuda(device_id)
+        self.flatten_parameters()
+        return ret
+
+    def cpu(self):
+        """Moves all model parameters and buffers to the CPU."""
+        ret = super(RNNBase, self).cpu()
+        self.flatten_parameters()
+        return ret
+
+    def float(self):
+        """Casts all parameters and buffers to float datatype."""
+        ret = super(RNNBase, self).float()
+        self.flatten_parameters()
+        return ret
+
+    def double(self):
+        """Casts all parameters and buffers to double datatype."""
+        ret = super(RNNBase, self).double()
+        self.flatten_parameters()
+        return ret
+
+    def half(self):
+        """Casts all parameters and buffers to half datatype."""
+        ret = super(RNNBase, self).half()
+        self.flatten_parameters()
+        return ret
 
     def __repr__(self):
         s = '{name}({input_size}, {hidden_size}'
